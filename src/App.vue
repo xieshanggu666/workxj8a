@@ -17,6 +17,7 @@
     <main>
       <DashboardView v-if="tab==='dash'" />
       <PostsView v-else-if="tab==='posts'" />
+      <CollectView v-else-if="tab==='collect'" />
       <AlertCenterView v-else-if="tab==='alerts'" />
       <CrisisView v-else-if="tab==='crisis'" />
       <NotifyView v-else-if="tab==='notify'" />
@@ -33,6 +34,7 @@ import { ref, onMounted } from 'vue'
 import { usePubStore } from '@/store/pub'
 import DashboardView from '@/components/DashboardView.vue'
 import PostsView from '@/components/PostsView.vue'
+import CollectView from '@/components/CollectView.vue'
 import AlertCenterView from '@/components/AlertCenterView.vue'
 import CrisisView from '@/components/CrisisView.vue'
 import NotifyView from '@/components/NotifyView.vue'
@@ -42,6 +44,7 @@ const tab = ref('dash')
 const tabs = [
   { key: 'dash', icon: '📊', label: '舆情总览', badge: () => store.activeAlerts.length || 0 },
   { key: 'posts', icon: '📰', label: '舆情列表' },
+  { key: 'collect', icon: '🛰️', label: '数据源采集', badge: () => store.stats.collectRunning || 0 },
   { key: 'alerts', icon: '🚨', label: '预警中心' },
   { key: 'crisis', icon: '🛟', label: '危机处置' },
   { key: 'notify', icon: '🔔', label: '通知中心', badge: () => store.stats.notifyOpen || 0 }

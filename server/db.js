@@ -200,6 +200,52 @@ CREATE TABLE IF NOT EXISTS import_job_items (
 );
 CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
+-- 数据源连接：管理员配置的多源接入（类型/地址/入库渠道/调度与重试策略），游标与运行态落库
+CREATE TABLE IF NOT EXISTS collect_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'api',      -- api/rss/crawler
+  endpoint TEXT NOT NULL DEFAULT '',     -- 连接地址（演示用 mock://；含 flaky 首发失败、always-fail 持续失败）
+  source_id INTEGER NOT NULL DEFAULT 1,  -- 入库渠道（posts.source_id）
+  topic TEXT NOT NULL DEFAULT '',        -- 默认话题（空=取条目自带话题）
+  media TEXT NOT NULL DEFAULT '',        -- 默认来源媒体
+  interval_sec INTEGER NOT NULL DEFAULT 15, -- 采集间隔（秒）
+  batch_size INTEGER NOT NULL DEFAULT 5,    -- 单次抓取条数
+  max_retry INTEGER NOT NULL DEFAULT 5,     -- 连续失败上限（达到后任务自动停止）
+  enabled INTEGER NOT NULL DEFAULT 1,    -- 连接启停（管理员）
+  running INTEGER NOT NULL DEFAULT 0,    -- 采集任务启停（值班员），重启后按游标接续
+  cursor TEXT NOT NULL DEFAULT '0',      -- 采集游标（已采到的外部条目位置）
+  fail_count INTEGER NOT NULL DEFAULT 0, -- 连续失败次数（退避重试依据）
+  next_run_at INTEGER,                   -- 下次调度毫秒时间戳（NULL=立即）
+  last_run_at TEXT,
+  last_status TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  total_runs INTEGER NOT NULL DEFAULT 0,
+  total_fetched INTEGER NOT NULL DEFAULT 0,
+  total_inserted INTEGER NOT NULL DEFAULT 0,
+  total_duplicated INTEGER NOT NULL DEFAULT 0,
+  created TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_collect_sources_due ON collect_sources (running, next_run_at);
+-- 采集运行记录：每次调度/手动采集一行（抓取/入库/去重/闭环结果与游标推进留痕）
+CREATE TABLE IF NOT EXISTS collect_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL,
+  status TEXT NOT NULL,               -- success/failed
+  fetched INTEGER NOT NULL DEFAULT 0, -- 抓取条数
+  inserted INTEGER NOT NULL DEFAULT 0,-- 新增入库
+  duplicated INTEGER NOT NULL DEFAULT 0, -- 幂等去重跳过
+  alerts INTEGER NOT NULL DEFAULT 0,  -- 触发预警次数
+  crises INTEGER NOT NULL DEFAULT 0,  -- 自动建档危机数
+  cursor_from TEXT NOT NULL DEFAULT '',
+  cursor_to TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '调度器', -- 调度器/手动触发人
+  started TEXT NOT NULL,
+  finished TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_collect_runs_source ON collect_runs (source_id, id);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
 `)
 
@@ -436,3 +482,18 @@ function seedNotify() {
   ns.run('危机结案通报', null, '', 'closed', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
 }
 seedNotify()
+
+// 数据源连接种子（独立幂等：老库升级后同样补齐演示连接；任务默认停止，由值班员启动）
+function seedCollect() {
+  const n = db.prepare('SELECT COUNT(*) c FROM collect_sources').get().c
+  if (n > 0) return
+  const nowStr = new Date().toLocaleString('zh-CN')
+  const cs = db.prepare(`INSERT INTO collect_sources (name,type,endpoint,source_id,topic,media,interval_sec,batch_size,max_retry,enabled,running,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,1,0,?,?)`)
+  cs.run('微博热搜 API', 'api', 'mock://weibo/hot-feed', 1, '', '', 15, 5, 5, nowStr, '系统初始化')
+  // flaky：首次采集模拟瞬时故障，演示失败退避自动重试
+  cs.run('新闻聚合 RSS', 'rss', 'mock://news/flaky-rss', 3, '', '', 20, 4, 5, nowStr, '系统初始化')
+  // always-fail：持续失败，演示退避重试到达上限后任务自动停止
+  cs.run('论坛爬虫（故障演练）', 'crawler', 'mock://forum/always-fail', 6, '', '', 30, 5, 3, nowStr, '系统初始化')
+}
+seedCollect()

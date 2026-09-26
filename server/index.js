@@ -12,6 +12,11 @@ import {
   pauseTask, resumeTask, retryTask, cancelTask, ackTask, listLogs,
   generateForCrisisStatus, seedNotifyTasks, startScheduler
 } from './notify.js'
+import {
+  SOURCE_TYPES, COLLECT_STATUS, listSources, listRuns, validateSource,
+  startTask, stopTask, runNowTask, resetCursor,
+  startCollectScheduler, resumeCollectTasks
+} from './collect.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -27,6 +32,10 @@ if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导�
 const seededNotify = seedNotifyTasks()
 if (seededNotify) console.log(`[NOTIFY] 为存量未解除预警生成 ${seededNotify} 个通知任务`)
 startScheduler()
+// 采集调度：运行中的采集任务随服务启动按游标自动接续（不丢不重）
+const resumedCollect = resumeCollectTasks()
+if (resumedCollect) console.log(`[COLLECT] ${resumedCollect} 个采集任务随启动自动接续（游标续采）`)
+startCollectScheduler()
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
@@ -56,7 +65,8 @@ app.get('/api/state', (req, res) => {
     (SELECT COUNT(*) FROM alert_events) alertTotal,
     (SELECT COUNT(*) FROM crisis WHERE status!='closed') crisisActive,
     (SELECT COUNT(*) FROM crisis WHERE status='closed') crisisClosed,
-    (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen`)
+    (SELECT COUNT(*) FROM notify_tasks WHERE status IN ('pending','failed')) notifyOpen,
+    (SELECT COUNT(*) FROM collect_sources WHERE running=1 AND enabled=1) collectRunning`)
   // 热度趋势（近7时段）
   const nowH = new Date().getHours()
   const trend = []
@@ -579,6 +589,95 @@ app.get('/api/notify/logs', (req, res) => {
     logs: listLogs({
       taskId: req.query.task_id ? +req.query.task_id : null,
       limit: Math.min(200, +req.query.limit || 100)
+    })
+  })
+})
+
+// ===== 数据源接入与采集调度 =====
+// 权限：admin 配置数据源连接（含游标归零）；ops 启停采集任务与手动采集；viewer 只读
+app.get('/api/collect/overview', (req, res) => {
+  const sources = listSources()
+  const counts = { running: 0, retrying: 0, stopped: 0, failed: 0, disabled: 0 }
+  for (const s of sources) counts[s.task_status] = (counts[s.task_status] || 0) + 1
+  const totals = q1(`SELECT COALESCE(SUM(total_runs),0) runs, COALESCE(SUM(total_inserted),0) inserted,
+    COALESCE(SUM(total_duplicated),0) duplicated FROM collect_sources`)
+  res.json({
+    sources, counts, totals,
+    runs: listRuns({ limit: 30 }),
+    actor: actorOf(req), roles: ROLE_TEXT,
+    sourceTypes: SOURCE_TYPES, collectStatus: COLLECT_STATUS,
+    channels: q('SELECT id,name FROM sources ORDER BY id')
+  })
+})
+
+// 数据源连接配置（admin）
+app.post('/api/collect/sources', guard('admin'), (req, res) => {
+  const err = validateSource(req.body)
+  if (err) return res.status(400).json({ error: err })
+  const b = req.body
+  run(`INSERT INTO collect_sources (name,type,endpoint,source_id,topic,media,interval_sec,batch_size,max_retry,enabled,running,created,created_by)
+    VALUES (?,?,?,?,?,?,?,?,?,1,0,?,?)`,
+    b.name.trim(), b.type, b.endpoint.trim(), +b.source_id, (b.topic || '').trim(), (b.media || '').trim(),
+    Math.max(5, +b.interval_sec || 15), Math.min(50, Math.max(1, +b.batch_size || 5)),
+    Math.min(10, Math.max(1, +b.max_retry || 5)), now(), req.actor.user)
+  res.json({ ok: true })
+})
+app.put('/api/collect/sources/:id', guard('admin'), (req, res) => {
+  const s = q1('SELECT * FROM collect_sources WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '数据源不存在' })
+  const err = validateSource(req.body)
+  if (err) return res.status(400).json({ error: err })
+  const b = req.body
+  run(`UPDATE collect_sources SET name=?,type=?,endpoint=?,source_id=?,topic=?,media=?,interval_sec=?,batch_size=?,max_retry=? WHERE id=?`,
+    b.name.trim(), b.type, b.endpoint.trim(), +b.source_id, (b.topic || '').trim(), (b.media || '').trim(),
+    Math.max(5, +b.interval_sec || 15), Math.min(50, Math.max(1, +b.batch_size || 5)),
+    Math.min(10, Math.max(1, +b.max_retry || 5)), s.id)
+  res.json({ ok: true })
+})
+// 连接启停（admin）：停用连接同时停止其采集任务
+app.post('/api/collect/sources/:id/toggle', guard('admin'), (req, res) => {
+  const s = q1('SELECT * FROM collect_sources WHERE id=?', req.params.id)
+  if (!s) return res.status(404).json({ error: '数据源不存在' })
+  const next = s.enabled ? 0 : 1
+  run('UPDATE collect_sources SET enabled=?, running=CASE WHEN ?=0 THEN 0 ELSE running END WHERE id=?', next, next, s.id)
+  res.json({ ok: true, enabled: next })
+})
+app.delete('/api/collect/sources/:id', guard('admin'), (req, res) => {
+  run('DELETE FROM collect_sources WHERE id=?', req.params.id) // 采集记录保留（历史留痕）
+  res.json({ ok: true })
+})
+
+// 采集任务启停与手动采集（ops）：启动即到期立即采一轮；停止后调度器跳过
+app.post('/api/collect/tasks/:id/start', guard('ops'), (req, res) => {
+  const r = startTask(+req.params.id)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, already: !!r.already })
+})
+app.post('/api/collect/tasks/:id/stop', guard('ops'), (req, res) => {
+  const r = stopTask(+req.params.id)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true, already: !!r.already })
+})
+app.post('/api/collect/tasks/:id/run', guard('ops'), (req, res) => {
+  const r = runNowTask(+req.params.id, req.actor.user)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, result: r.result })
+})
+// 游标归零（admin）：重新采集历史条目，幂等键自动去重
+app.post('/api/collect/tasks/:id/reset-cursor', guard('admin'), (req, res) => {
+  const r = resetCursor(+req.params.id)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true })
+})
+
+// 采集记录（可按数据源过滤）
+app.get('/api/collect/runs', (req, res) => {
+  res.json({
+    runs: listRuns({
+      sourceId: req.query.source_id ? +req.query.source_id : null,
+      limit: Math.min(200, +req.query.limit || 50)
     })
   })
 })

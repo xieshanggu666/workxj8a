@@ -120,6 +120,19 @@ export const usePubStore = defineStore('pub', {
       else this.msg(`回执已确认${r.crisisId ? `，已写入危机 #${r.crisisId} 时间线` : ''}`, 'success')
       return r
     },
-    async fetchNotifyLogs(taskId) { return (await api('/notify/logs', 'GET', null, taskId ? { task_id: taskId } : null)).logs }
+    async fetchNotifyLogs(taskId) { return (await api('/notify/logs', 'GET', null, taskId ? { task_id: taskId } : null)).logs },
+    // ===== 数据源接入与采集调度 =====
+    async fetchCollectOverview() { return await api('/collect/overview') },
+    async saveCollectSource(s) { await api('/collect/sources', 'POST', s); this.msg('数据源连接已保存', 'success') },
+    async updateCollectSource(id, s) { await api(`/collect/sources/${id}`, 'PUT', s); this.msg('数据源连接已更新', 'success') },
+    async toggleCollectSource(id) { await api(`/collect/sources/${id}/toggle`, 'POST') },
+    async delCollectSource(id) { await api(`/collect/sources/${id}`, 'DELETE'); this.msg('数据源已删除（采集记录保留）', 'success') },
+    // 采集任务操作（启动/停止/立即采集/游标归零）：统一入口，错误 toast 由调用方处理
+    async collectTaskOp(id, op) {
+      const r = await api(`/collect/tasks/${id}/${op}`, 'POST')
+      await this.load() // 采集带来新舆情：刷新总览统计与各闭环角标
+      return r
+    },
+    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs }
   }
 })
