@@ -120,6 +120,21 @@ export const usePubStore = defineStore('pub', {
       else this.msg(`回执已确认${r.crisisId ? `，已写入危机 #${r.crisisId} 时间线` : ''}`, 'success')
       return r
     },
-    async fetchNotifyLogs(taskId) { return (await api('/notify/logs', 'GET', null, taskId ? { task_id: taskId } : null)).logs }
+    async fetchNotifyLogs(taskId) { return (await api('/notify/logs', 'GET', null, taskId ? { task_id: taskId } : null)).logs },
+    // ===== 数据源接入与采集调度 =====
+    async fetchCollectOverview() { return await api('/collect/overview') },
+    async fetchCollectSource(id) { return await api(`/collect/sources/${id}`) },
+    async fetchCollectRuns(sourceId) { return (await api('/collect/runs', 'GET', null, sourceId ? { source_id: sourceId } : null)).runs },
+    async fetchCollectLogs(sourceId) { return (await api('/collect/logs', 'GET', null, sourceId ? { source_id: sourceId } : null)).logs },
+    // 管理员配置多源连接
+    async saveDatasource(s) { const d = await api('/collect/sources', 'POST', s); this.msg('数据源已创建', 'success'); return d.source },
+    async updateDatasource(id, s) { const d = await api(`/collect/sources/${id}`, 'PUT', s); this.msg('数据源配置已更新', 'success'); return d.source },
+    async delDatasource(id) { await api(`/collect/sources/${id}`, 'DELETE'); this.msg('数据源已删除', 'success') },
+    async toggleDatasource(id) { return (await api(`/collect/sources/${id}/toggle`, 'POST')).source },
+    // 值班员启停采集 / 立即采集（兼失败重试）/ 游标重置
+    async startCollect(id) { const d = await api(`/collect/sources/${id}/start`, 'POST'); this.msg('采集任务已启动', 'success'); return d.source },
+    async stopCollect(id) { const d = await api(`/collect/sources/${id}/stop`, 'POST'); this.msg('采集任务已停止', 'info'); return d.source },
+    async runCollect(id) { const d = await api(`/collect/sources/${id}/run`, 'POST'); this.msg('已触发立即采集', 'success'); return d.source },
+    async resetCollectCursor(id) { const d = await api(`/collect/sources/${id}/reset-cursor`, 'POST'); this.msg('游标已重置，下一轮重新回溯（幂等去重不产生重复）', 'info'); return d.source }
   }
 })

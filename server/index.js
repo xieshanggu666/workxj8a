@@ -12,6 +12,12 @@ import {
   pauseTask, resumeTask, retryTask, cancelTask, ackTask, listLogs,
   generateForCrisisStatus, seedNotifyTasks, startScheduler
 } from './notify.js'
+import {
+  overview as collectOverview, getDatasource, listDatasources, listRuns, listLogs as listCollectLogs,
+  validateDatasource, createDatasource, updateDatasource, deleteDatasource,
+  toggleDatasourceEnabled, startCollect, stopCollect, runNow, resetCursor,
+  startCollector, recoverCollect
+} from './collector.js'
 
 const app = express()
 app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
@@ -27,6 +33,11 @@ if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导�
 const seededNotify = seedNotifyTasks()
 if (seededNotify) console.log(`[NOTIFY] 为存量未解除预警生成 ${seededNotify} 个通知任务`)
 startScheduler()
+// 数据源采集：中断运行标记失败，仍处于运行中的采集任务立即补采一轮（游标保证不重复），启动采集调度器
+const recoveredCollect = recoverCollect()
+if (recoveredCollect.stale) console.log(`[COLLECT] ${recoveredCollect.stale} 个中断的采集运行已标记失败`)
+if (recoveredCollect.active) console.log(`[COLLECT] 恢复 ${recoveredCollect.active} 个运行中的采集任务（立即补采）`)
+startCollector()
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
@@ -581,6 +592,73 @@ app.get('/api/notify/logs', (req, res) => {
       limit: Math.min(200, +req.query.limit || 100)
     })
   })
+})
+
+// ===== 数据源接入与采集调度 =====
+// 权限：viewer 只读 / ops 值班员启停采集·立即采集·游标重置 / admin 管理员配置多源连接
+app.get('/api/collect/overview', (req, res) => {
+  res.json(collectOverview())
+})
+app.get('/api/collect/sources', (req, res) => res.json({ sources: listDatasources() }))
+app.get('/api/collect/sources/:id', (req, res) => {
+  const ds = getDatasource(+req.params.id)
+  if (!ds) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ source: ds, runs: listRuns({ sourceId: ds.id, limit: 20 }), logs: listCollectLogs({ sourceId: ds.id, limit: 50 }) })
+})
+app.get('/api/collect/runs', (req, res) => {
+  res.json({ runs: listRuns({ sourceId: req.query.source_id ? +req.query.source_id : null, limit: Math.min(200, +req.query.limit || 50) }) })
+})
+app.get('/api/collect/logs', (req, res) => {
+  res.json({ logs: listCollectLogs({ sourceId: req.query.source_id ? +req.query.source_id : null, limit: Math.min(200, +req.query.limit || 100) }) })
+})
+
+// 数据源连接配置（admin）
+app.post('/api/collect/sources', guard('admin'), (req, res) => {
+  const err = validateDatasource(req.body)
+  if (err) return res.status(400).json({ error: err })
+  res.json({ ok: true, source: createDatasource(req.body, req.actor) })
+})
+app.put('/api/collect/sources/:id', guard('admin'), (req, res) => {
+  const err = validateDatasource(req.body, { partial: true })
+  if (err) return res.status(400).json({ error: err })
+  const ds = updateDatasource(+req.params.id, req.body, req.actor)
+  if (!ds) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true, source: ds })
+})
+app.delete('/api/collect/sources/:id', guard('admin'), (req, res) => {
+  if (!deleteDatasource(+req.params.id, req.actor)) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true })
+})
+app.post('/api/collect/sources/:id/toggle', guard('admin'), (req, res) => {
+  const ds = toggleDatasourceEnabled(+req.params.id, req.actor)
+  if (!ds) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true, source: ds })
+})
+
+// 采集任务启停与手动触发（ops 值班员及以上）
+app.post('/api/collect/sources/:id/start', guard('ops'), (req, res) => {
+  const r = startCollect(+req.params.id, req.actor, { immediate: true })
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, source: r })
+})
+app.post('/api/collect/sources/:id/stop', guard('ops'), (req, res) => {
+  const r = stopCollect(+req.params.id, req.actor)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true, source: r })
+})
+// 立即采集（失败重试入口：重置退避并立刻跑一轮）
+app.post('/api/collect/sources/:id/run', guard('ops'), (req, res) => {
+  const r = runNow(+req.params.id, req.actor)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  if (r.error) return res.status(400).json({ error: r.error })
+  res.json({ ok: true, source: r })
+})
+// 游标重置（下轮重新回溯；幂等键保证回溯不重复入库）
+app.post('/api/collect/sources/:id/reset-cursor', guard('ops'), (req, res) => {
+  const r = resetCursor(+req.params.id, req.actor)
+  if (!r) return res.status(404).json({ error: '数据源不存在' })
+  res.json({ ok: true, source: r })
 })
 
 const PORT = Number(process.env.PORT) || 4130

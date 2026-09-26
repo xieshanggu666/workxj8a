@@ -201,6 +201,71 @@ CREATE TABLE IF NOT EXISTS import_job_items (
 CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
 -- 注：posts.idem_key 索引在下方 ensureColumn 之后创建（旧库可能尚无该列，此处创建会导致启动失败）
+
+-- ===== 数据源接入与采集调度 =====
+-- 数据源连接（admin 配置连接；ops 启停采集任务）。游标/失败计数/累计统计与连接配置同表，调度器按 next_run_at 派发
+CREATE TABLE IF NOT EXISTS datasources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'mock',    -- mock 模拟信息流 / rss RSS·Atom / api HTTP JSON
+  endpoint TEXT NOT NULL DEFAULT '',    -- mock://标识 / RSS URL / JSON 接口地址
+  source_id INTEGER NOT NULL DEFAULT 1, -- 采集舆情归属渠道（sources.id）
+  interval_sec INTEGER NOT NULL DEFAULT 30, -- 采集周期（秒）
+  batch INTEGER NOT NULL DEFAULT 5,     -- 单轮拉取/首轮回溯条数上限
+  max_retry INTEGER NOT NULL DEFAULT 3, -- 拉取失败自动重试上限
+  config TEXT NOT NULL DEFAULT '{}',    -- JSON（mock overlap / api 字段映射等）
+  enabled INTEGER NOT NULL DEFAULT 1,   -- 连接是否启用（管理员配置）
+  collect_active INTEGER NOT NULL DEFAULT 0, -- 采集任务是否运行中（值班员启停）
+  cursor TEXT NOT NULL DEFAULT '',      -- 增量游标（mock=偏移量；rss/api=最新条目时间+guid）
+  cursor_at TEXT,                       -- 游标最近推进时间
+  fail_count INTEGER NOT NULL DEFAULT 0,-- 当前连续失败次数（驱动退避重试）
+  last_trigger TEXT NOT NULL DEFAULT 'scheduler', -- 下一轮触发来源：scheduler/manual/start
+  next_run_at INTEGER,                  -- 下次到期毫秒时间戳（NULL=不调度）
+  last_run_at TEXT,
+  last_status TEXT NOT NULL DEFAULT '', -- running/retrying/success/failed
+  last_error TEXT NOT NULL DEFAULT '',
+  total_runs INTEGER NOT NULL DEFAULT 0,
+  total_fetched INTEGER NOT NULL DEFAULT 0,
+  total_inserted INTEGER NOT NULL DEFAULT 0,
+  total_duplicate INTEGER NOT NULL DEFAULT 0,
+  total_failed INTEGER NOT NULL DEFAULT 0, -- 拉取失败轮次（条目级失败计入运行明细）
+  created TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  updated TEXT NOT NULL
+);
+-- 采集运行记录：每次调度/手动触发行；attempts 记录退避重试轮次，成功后游标与闭环计数回写
+CREATE TABLE IF NOT EXISTS collect_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL,
+  triggered_by TEXT NOT NULL DEFAULT 'scheduler', -- scheduler/manual/start
+  status TEXT NOT NULL DEFAULT 'running',         -- running/retrying/success/failed
+  attempts INTEGER NOT NULL DEFAULT 0,
+  fetched INTEGER NOT NULL DEFAULT 0,
+  inserted INTEGER NOT NULL DEFAULT 0,
+  duplicate INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,              -- 条目级失败条数（单条失败不拖垮整轮）
+  alerts_fired INTEGER NOT NULL DEFAULT 0,
+  crises_created INTEGER NOT NULL DEFAULT 0,
+  crises_merged INTEGER NOT NULL DEFAULT 0,
+  cursor_before TEXT NOT NULL DEFAULT '',
+  cursor_after TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  started TEXT NOT NULL,
+  updated TEXT NOT NULL DEFAULT '',
+  finished TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_collect_runs_src ON collect_runs (source_id, id);
+-- 采集历史追踪：启停/拉取/重试/成功/失败/游标重置全程留痕（含操作人）
+CREATE TABLE IF NOT EXISTS collect_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL,
+  run_id INTEGER,
+  action TEXT NOT NULL,                 -- start/stop/run/retry/success/failed/reset/edit
+  detail TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '系统',
+  time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_collect_logs_src ON collect_logs (source_id, id);
 `)
 
 // 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）
@@ -436,3 +501,17 @@ function seedNotify() {
   ns.run('危机结案通报', null, '', 'closed', '', JSON.stringify([ch1]), 0, 30, null, 3, nowStr, '系统初始化')
 }
 seedNotify()
+
+// 数据源种子（独立幂等）：模拟信息流 + flaky 重试演练源 + RSS 示例（停用），默认均不启动采集，由值班员启停
+function seedDatasources() {
+  const n = db.prepare('SELECT COUNT(*) c FROM datasources').get().c
+  if (n > 0) return
+  const nowStr = new Date().toLocaleString('zh-CN')
+  const ds = db.prepare(`INSERT INTO datasources
+    (name,type,endpoint,source_id,interval_sec,batch,max_retry,config,enabled,collect_active,created,created_by,updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  ds.run('食安舆情模拟流', 'mock', 'mock://food-safety', 6, 30, 3, 3, JSON.stringify({ overlap: 1 }), 1, 0, nowStr, '系统初始化', nowStr)
+  ds.run('投诉监测模拟流（演练）', 'mock', 'mock://flaky-complaints', 1, 30, 3, 3, JSON.stringify({ overlap: 1 }), 1, 0, nowStr, '系统初始化', nowStr)
+  ds.run('科技媒体 RSS（示例）', 'rss', 'https://example.com/tech.xml', 3, 60, 10, 2, '{}', 0, 0, nowStr, '系统初始化', nowStr)
+}
+seedDatasources()

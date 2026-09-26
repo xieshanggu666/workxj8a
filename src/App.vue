@@ -17,6 +17,7 @@
     <main>
       <DashboardView v-if="tab==='dash'" />
       <PostsView v-else-if="tab==='posts'" />
+      <CollectView v-else-if="tab==='collect'" />
       <AlertCenterView v-else-if="tab==='alerts'" />
       <CrisisView v-else-if="tab==='crisis'" />
       <NotifyView v-else-if="tab==='notify'" />
@@ -33,6 +34,7 @@ import { ref, onMounted } from 'vue'
 import { usePubStore } from '@/store/pub'
 import DashboardView from '@/components/DashboardView.vue'
 import PostsView from '@/components/PostsView.vue'
+import CollectView from '@/components/CollectView.vue'
 import AlertCenterView from '@/components/AlertCenterView.vue'
 import CrisisView from '@/components/CrisisView.vue'
 import NotifyView from '@/components/NotifyView.vue'
@@ -42,10 +44,19 @@ const tab = ref('dash')
 const tabs = [
   { key: 'dash', icon: '📊', label: '舆情总览', badge: () => store.activeAlerts.length || 0 },
   { key: 'posts', icon: '📰', label: '舆情列表' },
+  { key: 'collect', icon: '🕸️', label: '数据源采集', badge: () => warnCollect.value },
   { key: 'alerts', icon: '🚨', label: '预警中心' },
   { key: 'crisis', icon: '🛟', label: '危机处置' },
   { key: 'notify', icon: '🔔', label: '通知中心', badge: () => store.stats.notifyOpen || 0 }
 ]
+// 采集角标：失败/退避重试中的数据源数（轻量轮询，与采集视图互不影响）
+const warnCollect = ref(0)
+async function refreshWarn() {
+  try {
+    const r = await fetch('/api/collect/overview').then((x) => x.json())
+    warnCollect.value = (r.counts.failed || 0) + (r.counts.retrying || 0)
+  } catch { /* 后端未启动时静默 */ }
+}
 // 演示权限模型：admin 配置+操作 / ops 任务操作 / viewer 只读（服务端强制校验）
 const users = [
   { name: '张岚', role: 'admin' },
@@ -63,6 +74,8 @@ function switchUser(i) {
 onMounted(async () => {
   try { await store.load() }
   catch (e) { store.msg('后端未启动，请运行 node server/index.js', 'warn') }
+  refreshWarn()
+  setInterval(refreshWarn, 5000)
 })
 </script>
 

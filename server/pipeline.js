@@ -63,7 +63,8 @@ export function validateItem(it, idx) {
 // 统一录入管线：情感分析 → 落库 → 预警检查（红/橙级自动建档危机或去重并入）。
 // idemKey：条目幂等键。键已存在时直接返回既有舆情，绝不重复触发预警/建档危机。
 // simFail：演练用瞬时故障注入（命中即抛错，由调用方消费一次后清除）。
-export function ingestPost(item, { idemKey = null, simFail = false } = {}) {
+// published：数据源采集时携带的源发布时间（ISO 字符串或时间戳），缺省取收录时刻。
+export function ingestPost(item, { idemKey = null, simFail = false, published = null } = {}) {
   if (simFail) throw new Error('模拟瞬时故障（演练注入，重试即可恢复）')
   if (idemKey) {
     const dup = q1('SELECT id FROM posts WHERE idem_key=?', idemKey)
@@ -76,12 +77,20 @@ export function ingestPost(item, { idemKey = null, simFail = false } = {}) {
   // 热度与负面关键词命中数挂钩，便于稳定演示预警触发
   const negHits = NEG.filter((w) => text.includes(w)).length
   const heat = Math.min(100, 35 + negHits * 12 + Math.round(Math.random() * 12) + (a.sentiment === 'negative' ? 8 : 0))
+  const pubStr = normalizePublished(published)
   const r = run('INSERT INTO posts (title,content,source_id,sentiment,sentiment_score,heat,hot,topic,media,published,created,idem_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
     title, content, item.source_id || 1, a.sentiment, a.score, heat,
-    a.sentiment === 'negative' ? 1 : 0, (item.topic || '').trim() || '新增', (item.media || '').trim(), now(), now(), idemKey)
+    a.sentiment === 'negative' ? 1 : 0, (item.topic || '').trim() || '新增', (item.media || '').trim(), pubStr, now(), idemKey)
   const id = Number(r.lastInsertRowid)
   const triggered = checkAlerts(id)
   return { id, title, sentiment: a.sentiment, score: a.score, heat, triggered, duplicate: false }
+}
+
+// 源发布时间归一化：支持 ISO/Date 可解析字符串与毫秒时间戳；非法值回退为收录时刻
+function normalizePublished(p) {
+  if (p == null || p === '') return now()
+  const t = typeof p === 'number' ? new Date(p) : new Date(p)
+  return Number.isNaN(t.getTime()) ? now() : t.toLocaleString('zh-CN')
 }
 
 // 已落库舆情的轻量结果（跨任务命中同一幂等键时回写用）
